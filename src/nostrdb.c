@@ -4946,8 +4946,9 @@ static int ndb_query_plan_scan_id_prefix(struct ndb_txn *txn, MDB_cursor *cur,
  * entry >= key and it then steps back one. The note_id, note_pubkey,
  * note_kind, note_pubkey_kind and note_tags keys all end in created_at, so
  * seeking on until itself skipped every note at exactly created_at == until.
- * Seek on the first second past it instead. The relay+kind and fulltext plans seek on keys that already
- * sort after every note at until, so they keep using until as is. */
+ * Seek on the first second past it instead. The relay+kind and fulltext
+ * plans seek on keys that already sort after every note at until, so they
+ * keep using until as is. */
 static uint64_t ndb_until_seek(struct ndb_filter *filter)
 {
 	uint64_t *pint;
