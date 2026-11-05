@@ -3345,13 +3345,16 @@ static void test_query_ordering()
 		assert(ndb_query(&txn, f, 1, results, ORDER_NOTES, &count));
 		assert(count > 0);
 
-		// until is exclusive in the index scan, as elsewhere here
+		// NIP-01: until is inclusive, so note 39 (author 1, kind 1)
+		// comes back first
+		assert(ndb_note_created_at(results[0].note) ==
+		       (uint64_t)(ORDER_BASE_TIME + 39));
 		prev = UINT64_MAX;
 		for (i = 0; i < count; i++) {
 			uint64_t at = ndb_note_created_at(results[i].note);
 			uint64_t kind = ndb_note_kind(results[i].note);
 
-			assert(at < (uint64_t)(ORDER_BASE_TIME + 39));
+			assert(at <= (uint64_t)(ORDER_BASE_TIME + 39));
 			assert(kind == 1 || kind == 7);
 			assert(at <= prev);
 			prev = at;
@@ -3388,14 +3391,184 @@ static void test_query_ordering()
 
 		assert(ndb_query(&txn, f, 1, results, ORDER_NOTES, &count));
 
-		// notes 35..39 inclusive, newest first. until is exclusive in
-		// the index scan, so 39 itself is not expected here
-		assert(count == 4);
+		// notes 35..39 inclusive, newest first (NIP-01: since <=
+		// created_at <= until)
+		assert(count == 5);
 		for (i = 0; i < count; i++)
 			assert(ndb_note_created_at(results[i].note) ==
-			       (uint64_t)(ORDER_BASE_TIME + 38 - i));
+			       (uint64_t)(ORDER_BASE_TIME + 39 - i));
 	}
 	ndb_filter_destroy(f);
+
+	ndb_end_query(&txn);
+	ndb_destroy(ndb);
+}
+
+#define UNTIL_T 1710000000
+#define UNTIL_NOTES 9
+#define UNTIL_AUTHOR "00000000000000000000000000000000000000000000000000000000000000a1"
+#define UNTIL_RELAY "wss://relay.damus.io"
+
+/* note i: created_at, so 2 notes at T-1, 5 at T and 2 at T+1 */
+static int until_note_time(int i) { return UNTIL_T + (i < 2 ? -1 : i < 7 ? 0 : 1); }
+
+/* Ids fall as created_at rises, so id order and created_at order disagree
+ * and a scan that starts inside a second cannot pass by luck. */
+static int until_note_id(int i) { return 0xf0 - i * 0x10; }
+
+/* Runs a finished filter and checks it found `expect` notes, none newer
+ * than T. Destroys the filter. */
+static void until_check_filter(struct ndb_txn *txn, struct ndb_filter *f,
+			       const char *what, int expect)
+{
+	struct ndb_query_result results[UNTIL_NOTES];
+	int i, count = -1;
+
+	assert(ndb_query(txn, f, 1, results, UNTIL_NOTES, &count));
+	if (count != expect) {
+		fprintf(stderr, "until query %s: got %d, want %d\n", what, count, expect);
+		assert(!"until is not inclusive");
+	}
+	for (i = 0; i < count; i++)
+		assert(ndb_note_created_at(results[i].note) <= UNTIL_T);
+	ndb_filter_destroy(f);
+}
+
+static void until_check(struct ndb_txn *txn, const char *js, int expect)
+{
+	struct ndb_filter filter, *f = &filter;
+	unsigned char buf[1024];
+
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_from_json(js, strlen(js), f, buf, sizeof(buf)));
+	until_check_filter(txn, f, js, expect);
+}
+
+/* The JSON filter parser has no "relays" key, so the relay_kinds plan is
+ * reached with a filter built field by field. since 0 means no since. */
+static void until_check_relay(struct ndb_txn *txn, uint64_t since, int expect)
+{
+	struct ndb_filter filter, *f = &filter;
+
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_RELAYS));
+	assert(ndb_filter_add_str_element(f, UNTIL_RELAY));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_start_field(f, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(f, 1));
+	ndb_filter_end_field(f);
+	if (since) {
+		assert(ndb_filter_start_field(f, NDB_FILTER_SINCE));
+		assert(ndb_filter_add_int_element(f, since));
+		ndb_filter_end_field(f);
+	}
+	assert(ndb_filter_start_field(f, NDB_FILTER_UNTIL));
+	assert(ndb_filter_add_int_element(f, UNTIL_T));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_end(f));
+	until_check_filter(txn, f, since ? "relay_kinds since=until=T" : "relay_kinds until=T", expect);
+}
+
+/* NIP-01: since <= created_at <= until. Every query plan must hand back the
+ * notes at created_at == until. The index seeks used to step back past them,
+ * so {until: T} dropped all five notes at T on every plan but relay_kinds. */
+static void test_until_is_inclusive()
+{
+	struct ndb *ndb;
+	struct ndb_txn txn;
+	struct ndb_config config;
+	struct ndb_filter filter, *f = &filter;
+	struct ndb_ingest_meta meta;
+	uint64_t note_ids[UNTIL_NOTES], subid;
+	char json[1024], js[512];
+	int i, nres, attempts, seen;
+
+	static const char *sig =
+		"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+		"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+	/* one per query plan that takes an until, in ndb_filter_plan's terms */
+	static const char *plans[] = {
+		"\"kinds\":[1],",                                         /* kinds */
+		"\"authors\":[\"" UNTIL_AUTHOR "\"],",                    /* authors */
+		"\"authors\":[\"" UNTIL_AUTHOR "\"],\"kinds\":[1],",      /* author_kinds */
+		"\"#t\":[\"until\"],",                                    /* tags */
+		"",                                                       /* created_at */
+	};
+
+	delete_test_db();
+	ndb_default_config(&config);
+	ndb_config_set_flags(&config, NDB_FLAG_SKIP_NOTE_VERIFY);
+	assert(ndb_init(&ndb, test_dir, &config));
+
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(f, 1));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_end(f));
+	assert((subid = ndb_subscribe(ndb, f, 1)));
+	ndb_filter_destroy(f);
+
+	for (i = 0; i < UNTIL_NOTES; i++) {
+		snprintf(json, sizeof(json),
+			 "[\"EVENT\",{\"id\":\"%064x\",\"pubkey\":\"" UNTIL_AUTHOR "\","
+			 "\"created_at\":%d,\"kind\":1,\"tags\":[[\"t\",\"until\"]],"
+			 "\"content\":\"u%d\",\"sig\":\"%s\"}]",
+			 until_note_id(i), until_note_time(i), i, sig);
+		ndb_ingest_meta_init(&meta, 1, UNTIL_RELAY);
+		assert(ndb_process_event_with(ndb, json, strlen(json), &meta));
+	}
+
+	for (nres = 0, attempts = 0; nres < UNTIL_NOTES && attempts < 500;
+	     attempts++) {
+		nres += ndb_poll_for_notes(ndb, subid, note_ids + nres,
+					   UNTIL_NOTES - nres);
+		if (nres < UNTIL_NOTES)
+			usleep(10000);
+	}
+	assert(nres == UNTIL_NOTES);
+
+	// the relay index lands after the note itself
+	for (attempts = 0, seen = 0; !seen && attempts < 500; attempts++) {
+		assert(ndb_begin_query(ndb, &txn));
+		for (i = 0, seen = 1; i < UNTIL_NOTES && seen; i++) {
+			unsigned char id[32] = {0};
+			uint64_t note_key;
+
+			id[31] = until_note_id(i);
+			seen = (note_key = ndb_get_notekey_by_id(&txn, id)) &&
+			       ndb_note_seen_on_relay(&txn, note_key, UNTIL_RELAY);
+		}
+		ndb_end_query(&txn);
+		if (!seen)
+			usleep(10000);
+	}
+	assert(seen);
+
+	assert(ndb_begin_query(ndb, &txn));
+
+	for (i = 0; i < (int)ARRAY_SIZE(plans); i++) {
+		// up to and including T: the 2 notes at T-1 and all 5 at T
+		snprintf(js, sizeof(js), "{%s\"until\":%d}", plans[i], UNTIL_T);
+		until_check(&txn, js, 7);
+
+		// exactly the second T
+		snprintf(js, sizeof(js), "{%s\"since\":%d,\"until\":%d}",
+			 plans[i], UNTIL_T, UNTIL_T);
+		until_check(&txn, js, 5);
+	}
+
+	// relay_kinds already seeks past every note at until; keep it so
+	until_check_relay(&txn, 0, 7);
+	until_check_relay(&txn, UNTIL_T, 5);
+
+	// ids: a note at T is found with until T, a note at T+1 is not
+	snprintf(js, sizeof(js), "{\"ids\":[\"%064x\"],\"until\":%d}",
+		 until_note_id(4), UNTIL_T);
+	until_check(&txn, js, 1);
+	snprintf(js, sizeof(js), "{\"ids\":[\"%064x\"],\"until\":%d}",
+		 until_note_id(8), UNTIL_T);
+	until_check(&txn, js, 0);
 
 	ndb_end_query(&txn);
 	ndb_destroy(ndb);
@@ -4181,6 +4354,7 @@ int main(int argc, const char *argv[]) {
 	test_single_url_parsing();
 	test_url_parsing();
 	test_query();
+	test_until_is_inclusive();
 	test_query_ordering();
 	test_multifilter_query();
 	test_multifilter_query_fair_distribution();
