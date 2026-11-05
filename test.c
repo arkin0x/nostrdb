@@ -3469,6 +3469,28 @@ static void test_until_is_inclusive()
 	until_check_relay(&txn, 0, 7);
 	until_check_relay(&txn, UNTIL_T, 5);
 
+	// until at UINT64_MAX means no bound: ndb_until_seek must not wrap
+	// it to 0, which would seek before every note and find none
+	{
+		struct ndb_query_result all[UNTIL_NOTES];
+		int count = -1;
+
+		assert(ndb_filter_init(f));
+		assert(ndb_filter_start_field(f, NDB_FILTER_KINDS));
+		assert(ndb_filter_add_int_element(f, 1));
+		ndb_filter_end_field(f);
+		assert(ndb_filter_start_field(f, NDB_FILTER_UNTIL));
+		assert(ndb_filter_add_int_element(f, UINT64_MAX));
+		ndb_filter_end_field(f);
+		assert(ndb_filter_end(f));
+		assert(ndb_query(&txn, f, 1, all, UNTIL_NOTES, &count));
+		if (count != UNTIL_NOTES) {
+			fprintf(stderr, "until UINT64_MAX: got %d, want %d\n", count, UNTIL_NOTES);
+			assert(!"until UINT64_MAX lost notes");
+		}
+		ndb_filter_destroy(f);
+	}
+
 	// ids: a note at T is found with until T, a note at T+1 is not
 	snprintf(js, sizeof(js), "{\"ids\":[\"%064x\"],\"until\":%d}",
 		 until_note_id(4), UNTIL_T);
