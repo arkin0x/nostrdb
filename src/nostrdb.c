@@ -1594,7 +1594,8 @@ static int ndb_filter_matches_with(struct ndb_filter *filter,
 		case NDB_FILTER_UNTIL:
 			assert(els->count == 1);
 			// NIP-01: since <= created_at <= until. The index seeks
-			// were already inclusive; the in-memory match was not
+			// start just past until (ndb_until_seek); this match is
+			// what keeps anything newer out
 			if (note->created_at <= els->elements[0])
 				continue;
 			break;
